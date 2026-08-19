@@ -138,6 +138,7 @@ pub enum Action {
     BecomeLeader { term },
     BecomeFollower { term, leader },
     BecomeCandidate { term },
+    SnapshotNeeded { last_applied },
     SnapshotInstallComplete { index },
 }
 ```
@@ -195,7 +196,8 @@ flowchart LR
 | `Broadcast { msg }` | Mở rộng thành `Send` cho mỗi voter khác |
 | `BecomeLeader/Follower/Candidate` | `ToSwarm::GenerateEvent(Event::RoleChanged)` |
 | `Apply { entries }` | `Event::Committed { entries }` |
-| `SnapshotInstallComplete` | Stub Phase 4 (hiện no-op) |
+| `SnapshotNeeded { last_applied }` | `Event::SnapshotNeeded` — app serialize state rồi gọi `RaftBehaviour::compact(last_applied, blob)` |
+| `SnapshotInstallComplete` | `Event::SnapshotInstalled { snapshot }` — app reset state machine từ `state_blob` |
 
 ### 4.3 Behaviour → App (public events)
 

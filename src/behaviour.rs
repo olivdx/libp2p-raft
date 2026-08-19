@@ -23,7 +23,7 @@ use crate::handler::{FromBehaviour, RaftHandler, ToBehaviour};
 use crate::peer_map::PeerMap;
 use crate::protocol::messages::RaftMessage;
 use crate::raft::engine::{Action, RaftEngine, RpcKind};
-use crate::raft::types::{Index, LogEntry, NodeId, Role, Term};
+use crate::raft::types::{Index, LogEntry, NodeId, Role, Snapshot, Term};
 use crate::storage::Storage;
 
 #[derive(Debug)]
@@ -35,6 +35,16 @@ pub enum Event {
     },
     Committed {
         entries: Vec<LogEntry>,
+    },
+    /// Applied log exceeded `snapshot_threshold`. Serialize the state machine as of
+    /// `last_applied` and call [`RaftBehaviour::compact`].
+    SnapshotNeeded {
+        last_applied: Index,
+    },
+    /// A snapshot from the leader was installed; reset the state machine from
+    /// `snapshot.state_blob` (entries <= `last_included_index` are already reflected).
+    SnapshotInstalled {
+        snapshot: Snapshot,
     },
     PeerMapped {
         peer: PeerId,
@@ -122,6 +132,16 @@ impl<S: Storage + 'static> RaftBehaviour<S> {
 
     pub fn commit_index(&self) -> Index {
         self.engine.commit_index()
+    }
+
+    /// Current snapshot, if any.
+    pub fn snapshot(&self) -> Option<Snapshot> {
+        self.engine.snapshot()
+    }
+
+    /// Store a snapshot of the state machine as of `index` and compact the log.
+    pub fn compact(&mut self, index: Index, state_blob: Vec<u8>) -> Result<(), Error> {
+        Ok(self.engine.compact(index, state_blob)?)
     }
 
     pub fn peer_map(&self) -> &PeerMap {
@@ -288,7 +308,20 @@ impl<S: Storage + 'static> RaftBehaviour<S> {
                     self.pending_events
                         .push_back(ToSwarm::GenerateEvent(Event::Committed { entries }));
                 }
-                Action::SnapshotInstallComplete { .. } => {}
+                Action::SnapshotNeeded { last_applied } => {
+                    self.pending_events
+                        .push_back(ToSwarm::GenerateEvent(Event::SnapshotNeeded {
+                            last_applied,
+                        }));
+                }
+                Action::SnapshotInstallComplete { .. } => {
+                    if let Some(snapshot) = self.engine.snapshot() {
+                        self.pending_events
+                            .push_back(ToSwarm::GenerateEvent(Event::SnapshotInstalled {
+                                snapshot,
+                            }));
+                    }
+                }
             }
         }
     }

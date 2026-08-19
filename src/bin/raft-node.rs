@@ -298,6 +298,19 @@ fn handle_event(
                 );
             }
         }
+        SwarmEvent::Behaviour(Event::SnapshotNeeded { last_applied }) => {
+            // Demo node keeps no state machine; a real app serializes its state here
+            // and calls `swarm.behaviour_mut().compact(last_applied, blob)`.
+            println!("node {node_id} SnapshotNeeded last_applied={last_applied}");
+        }
+        SwarmEvent::Behaviour(Event::SnapshotInstalled { snapshot }) => {
+            println!(
+                "node {node_id} SnapshotInstalled index={} term={} bytes={}",
+                snapshot.last_included_index,
+                snapshot.last_included_term,
+                snapshot.state_blob.len()
+            );
+        }
         SwarmEvent::Behaviour(Event::PeerMapped { peer, node }) => {
             println!("node {node_id} PeerMapped peer={peer} node={node}");
         }

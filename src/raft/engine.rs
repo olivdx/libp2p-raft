@@ -6,7 +6,11 @@ use crate::error::RaftError;
 use crate::protocol::messages::RaftMessage;
 use crate::raft::log::log_is_up_to_date;
 use crate::raft::membership::Membership;
-use crate::raft::types::{EntryType, HardState, Index, LogEntry, NodeId, Role, Term};
+use crate::raft::snapshot::{
+    should_snapshot, AssembleOutcome, InboundAssembly, OutboundTransfer,
+    DEFAULT_SNAPSHOT_CHUNK_SIZE,
+};
+use crate::raft::types::{EntryType, HardState, Index, LogEntry, NodeId, Role, Snapshot, Term};
 use crate::storage::Storage;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +28,12 @@ pub enum Action {
     BecomeLeader { term: Term },
     BecomeFollower { term: Term, leader: Option<NodeId> },
     BecomeCandidate { term: Term },
+    /// Applied log has grown past `snapshot_threshold` since the last snapshot.
+    /// The application should serialize its state machine (as of `last_applied`)
+    /// and call `RaftEngine::compact(last_applied, blob)`.
+    SnapshotNeeded { last_applied: Index },
+    /// A leader snapshot was fully received and installed at `index`; the
+    /// application must reset its state machine from `RaftEngine::snapshot()`.
     SnapshotInstallComplete { index: Index },
 }
 
@@ -49,12 +59,21 @@ pub struct RaftEngine<S: Storage> {
     ae_inflight: HashSet<NodeId>,
     commit_index: Index,
     last_applied: Index,
+    /// Leader -> follower snapshot transfers in progress.
+    snap_out: HashMap<NodeId, OutboundTransfer>,
+    /// Follower-side chunk assembly.
+    snap_in: InboundAssembly,
+    /// `SnapshotNeeded` already emitted and not yet answered by `compact`.
+    snapshot_requested: bool,
+    snapshot_chunk_size: usize,
 }
 
 impl<S: Storage> RaftEngine<S> {
     pub fn new(config: RaftConfig, storage: S) -> Self {
         let now = Instant::now();
         let membership = Membership::new(config.voters.iter().copied());
+        // Everything up to a stored snapshot is committed and applied by definition.
+        let snap_index = storage.first_index() - 1;
 
         Self {
             election_deadline: now + config.election_timeout + config.election_jitter,
@@ -69,8 +88,78 @@ impl<S: Storage> RaftEngine<S> {
             match_index: HashMap::new(),
             last_ae: HashMap::new(),
             ae_inflight: HashSet::new(),
-            commit_index: 0,
-            last_applied: 0,
+            commit_index: snap_index,
+            last_applied: snap_index,
+            snap_out: HashMap::new(),
+            snap_in: InboundAssembly::default(),
+            snapshot_requested: false,
+            snapshot_chunk_size: DEFAULT_SNAPSHOT_CHUNK_SIZE,
+        }
+    }
+
+    /// Override the `InstallSnapshot` chunk size (bytes).
+    pub fn set_snapshot_chunk_size(&mut self, bytes: usize) {
+        self.snapshot_chunk_size = bytes.max(1);
+    }
+
+    /// Current snapshot held in storage, if any.
+    pub fn snapshot(&self) -> Option<Snapshot> {
+        self.storage.snapshot()
+    }
+
+    pub fn first_index(&self) -> Index {
+        self.storage.first_index()
+    }
+
+    pub fn last_index(&self) -> Index {
+        self.storage.last_index_term().0
+    }
+
+    /// Create a snapshot of the state machine as of `index` (must be
+    /// `<= last_applied`) and compact the log prefix up to `index`.
+    pub fn compact(&mut self, index: Index, state_blob: Vec<u8>) -> Result<(), RaftError> {
+        if index == 0 || index > self.last_applied {
+            return Err(RaftError::InvalidSnapshotIndex);
+        }
+        let Some(term) = self.term_at(index) else {
+            return Err(RaftError::InvalidSnapshotIndex);
+        };
+        let mut conf: Vec<NodeId> = self.membership.voters().iter().copied().collect();
+        conf.sort_unstable();
+        self.storage.install_snapshot(Snapshot {
+            last_included_index: index,
+            last_included_term: term,
+            conf,
+            state_blob,
+        });
+        self.snapshot_requested = false;
+        Ok(())
+    }
+
+    /// Term of the entry at `index`, consulting the snapshot boundary.
+    fn term_at(&self, index: Index) -> Option<Term> {
+        if index == 0 {
+            return Some(0);
+        }
+        if let Some(e) = self.storage.entry(index) {
+            return Some(e.term);
+        }
+        match self.storage.snapshot() {
+            Some(s) if s.last_included_index == index => Some(s.last_included_term),
+            _ => None,
+        }
+    }
+
+    fn maybe_request_snapshot(&mut self, actions: &mut Vec<Action>) {
+        if self.snapshot_requested {
+            return;
+        }
+        let snap = self.storage.snapshot();
+        if should_snapshot(self.last_applied, snap.as_ref(), self.config.snapshot_threshold) {
+            self.snapshot_requested = true;
+            actions.push(Action::SnapshotNeeded {
+                last_applied: self.last_applied,
+            });
         }
     }
 
@@ -200,13 +289,41 @@ impl<S: Storage> RaftEngine<S> {
                 success,
                 match_index,
             } => self.handle_append_entries_resp(from, term, success, match_index, now),
-            _ => Vec::new(),
+            RaftMessage::InstallSnapshot {
+                term,
+                leader_id,
+                last_included_index,
+                last_included_term,
+                offset,
+                data,
+                done,
+            } => self.handle_install_snapshot(
+                from,
+                term,
+                leader_id,
+                last_included_index,
+                last_included_term,
+                offset,
+                data,
+                done,
+                now,
+            ),
+            RaftMessage::InstallSnapshotResp { term } => {
+                self.handle_install_snapshot_resp(from, term)
+            }
         }
     }
 
     pub fn handle_rpc_failure(&mut self, to: NodeId, kind: RpcKind) -> Vec<Action> {
-        if matches!(kind, RpcKind::AppendEntries) {
-            self.ae_inflight.remove(&to);
+        match kind {
+            RpcKind::AppendEntries => {
+                self.ae_inflight.remove(&to);
+            }
+            RpcKind::InstallSnapshot => {
+                // No resume: next attempt restarts from offset 0.
+                self.snap_out.remove(&to);
+            }
+            RpcKind::RequestVote => {}
         }
         Vec::new()
     }
@@ -262,6 +379,7 @@ impl<S: Storage> RaftEngine<S> {
         self.match_index.clear();
         self.last_ae.clear();
         self.ae_inflight.clear();
+        self.snap_out.clear();
 
         actions.push(Action::BecomeFollower { term, leader });
     }
@@ -276,6 +394,8 @@ impl<S: Storage> RaftEngine<S> {
         self.match_index.clear();
         self.last_ae.clear();
         self.ae_inflight.clear();
+        self.snap_out.clear();
+        self.snap_in.reset();
         for voter in self.membership.voters() {
             if *voter != self.config.node_id {
                 self.next_index.insert(*voter, last_index + 1);
@@ -418,12 +538,16 @@ impl<S: Storage> RaftEngine<S> {
         // Legitimate leader contact: reset deadline even if prev_log fails.
         self.reset_election_deadline(now);
 
+        // Entries at or below the snapshot index are committed and already
+        // reflected in the snapshot; a prev inside that range matches by definition.
+        let snap_index = self.storage.first_index() - 1;
         let prev_ok = if prev_log_index == 0 {
             prev_log_term == 0
+        } else if prev_log_index < snap_index {
+            true
         } else {
-            self.storage
-                .entry(prev_log_index)
-                .map(|e| e.term == prev_log_term)
+            self.term_at(prev_log_index)
+                .map(|t| t == prev_log_term)
                 .unwrap_or(false)
         };
 
@@ -444,6 +568,11 @@ impl<S: Storage> RaftEngine<S> {
         let mut append_from = 0usize;
         for (i, e) in entries.iter().enumerate() {
             let idx = prev_log_index + 1 + i as Index;
+            if idx <= snap_index {
+                // Covered by snapshot; nothing to append.
+                append_from = i + 1;
+                continue;
+            }
             match self.storage.entry(idx) {
                 Some(existing) if existing.term == e.term => {
                     append_from = i + 1;
@@ -507,6 +636,7 @@ impl<S: Storage> RaftEngine<S> {
         if !entries.is_empty() {
             actions.push(Action::Apply { entries });
         }
+        self.maybe_request_snapshot(actions);
     }
 
     fn handle_append_entries_resp(
@@ -581,6 +711,11 @@ impl<S: Storage> RaftEngine<S> {
         if self.ae_inflight.contains(&to) {
             return None;
         }
+        // Follower needs entries we have compacted away -> ship the snapshot.
+        let next = *self.next_index.get(&to)?;
+        if next < self.storage.first_index() {
+            return self.send_snapshot_chunk_to(to);
+        }
         let (msg, prev, len) = self.build_append_entries(to)?;
         self.last_ae.insert(to, (prev, len));
         self.ae_inflight.insert(to);
@@ -590,11 +725,7 @@ impl<S: Storage> RaftEngine<S> {
     fn build_append_entries(&self, to: NodeId) -> Option<(RaftMessage, Index, usize)> {
         let next = *self.next_index.get(&to)?;
         let prev_log_index = next.saturating_sub(1);
-        let prev_log_term = if prev_log_index == 0 {
-            0
-        } else {
-            self.storage.entry(prev_log_index)?.term
-        };
+        let prev_log_term = self.term_at(prev_log_index)?;
         let (last_index, _) = self.storage.last_index_term();
         let mut entries = Vec::new();
         let mut idx = next;
@@ -615,6 +746,145 @@ impl<S: Storage> RaftEngine<S> {
             prev_log_index,
             entries_len,
         ))
+    }
+
+    /// Leader: send the next snapshot chunk to `to` (one chunk in flight per peer).
+    fn send_snapshot_chunk_to(&mut self, to: NodeId) -> Option<Action> {
+        let snap = self.storage.snapshot()?;
+        let transfer = self
+            .snap_out
+            .entry(to)
+            .or_insert_with(|| OutboundTransfer::new(snap.last_included_index));
+        if transfer.inflight_len.is_some() {
+            return None;
+        }
+        if transfer.last_included_index != snap.last_included_index {
+            // Local snapshot advanced mid-transfer: restart from 0.
+            *transfer = OutboundTransfer::new(snap.last_included_index);
+        }
+        let (offset, data, done) = transfer.next_chunk(&snap.state_blob, self.snapshot_chunk_size);
+        transfer.inflight_len = Some(data.len() as u64);
+        transfer.inflight_done = done;
+        Some(Action::Send {
+            to,
+            msg: RaftMessage::InstallSnapshot {
+                term: self.current_term(),
+                leader_id: self.config.node_id,
+                last_included_index: snap.last_included_index,
+                last_included_term: snap.last_included_term,
+                offset,
+                data: data.to_vec(),
+                done,
+            },
+        })
+    }
+
+    fn handle_install_snapshot_resp(&mut self, from: NodeId, term: Term) -> Vec<Action> {
+        let mut actions = Vec::new();
+        let current_term = self.current_term();
+        if term > current_term {
+            self.become_follower(term, None, &mut actions);
+            return actions;
+        }
+        if self.role != Role::Leader || term != current_term {
+            return actions;
+        }
+        let Some(transfer) = self.snap_out.get_mut(&from) else {
+            return actions;
+        };
+        let Some(len) = transfer.inflight_len.take() else {
+            return actions; // stale ack
+        };
+        if transfer.inflight_done {
+            let index = transfer.last_included_index;
+            self.snap_out.remove(&from);
+            let cur = self.match_index.get(&from).copied().unwrap_or(0);
+            self.match_index.insert(from, cur.max(index));
+            self.next_index.insert(from, index + 1);
+            self.maybe_commit(&mut actions);
+            let (last, _) = self.storage.last_index_term();
+            if index < last {
+                if let Some(a) = self.send_append_entries_to(from) {
+                    actions.push(a);
+                }
+            }
+        } else {
+            transfer.offset += len;
+            if let Some(a) = self.send_snapshot_chunk_to(from) {
+                actions.push(a);
+            }
+        }
+        actions
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_install_snapshot(
+        &mut self,
+        from: NodeId,
+        term: Term,
+        leader_id: NodeId,
+        last_included_index: Index,
+        last_included_term: Term,
+        offset: u64,
+        data: Vec<u8>,
+        done: bool,
+        now: Instant,
+    ) -> Vec<Action> {
+        let mut actions = Vec::new();
+        let current_term = self.current_term();
+
+        if term < current_term {
+            actions.push(Action::Send {
+                to: from,
+                msg: RaftMessage::InstallSnapshotResp { term: current_term },
+            });
+            return actions;
+        }
+
+        if term > current_term || self.role != Role::Follower {
+            self.become_follower(term, Some(leader_id), &mut actions);
+        } else {
+            self.leader = Some(leader_id);
+        }
+        self.reset_election_deadline(now);
+
+        // Snapshot older than what we already committed carries nothing new.
+        if last_included_index <= self.commit_index {
+            self.snap_in.reset();
+        } else {
+            match self.snap_in.accept(
+                last_included_index,
+                last_included_term,
+                offset,
+                &data,
+                done,
+            ) {
+                AssembleOutcome::Partial | AssembleOutcome::Rejected => {}
+                AssembleOutcome::Complete(blob) => {
+                    let conf: Vec<NodeId> = self.membership.voters().iter().copied().collect();
+                    self.storage.install_snapshot(Snapshot {
+                        last_included_index,
+                        last_included_term,
+                        conf,
+                        state_blob: blob,
+                    });
+                    self.commit_index = self.commit_index.max(last_included_index);
+                    self.last_applied = self.last_applied.max(last_included_index);
+                    self.snapshot_requested = false;
+                    actions.push(Action::SnapshotInstallComplete {
+                        index: last_included_index,
+                    });
+                }
+            }
+        }
+
+        actions.push(Action::Send {
+            to: from,
+            msg: RaftMessage::InstallSnapshotResp {
+                term: self.current_term(),
+            },
+        });
+        actions
     }
 
     fn maybe_commit(&mut self, actions: &mut Vec<Action>) {

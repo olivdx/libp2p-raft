@@ -35,4 +35,4 @@ Snapshots, membership change, disk persistence, election no-op.
 
 ## Next
 
-Phase 4 — snapshots / InstallSnapshot.
+Phase 4 — snapshots / InstallSnapshot → [`phase-4.md`](phase-4.md).

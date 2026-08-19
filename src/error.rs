@@ -22,6 +22,8 @@ pub enum RaftError {
     MembershipPending,
     #[error("invalid membership change")]
     InvalidMembership,
+    #[error("invalid snapshot index")]
+    InvalidSnapshotIndex,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]

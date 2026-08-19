@@ -150,7 +150,9 @@ propose_membership(AddNode | RemoveNode) → Index
 apply_ready()        → committed entries
 ```
 
-**Actions:** `Send`, `Broadcast` (Behaviour expands to per-peer `Send`), `Apply`, `BecomeLeader|Follower|Candidate`, `SnapshotInstallComplete`.
+**Actions:** `Send`, `Broadcast` (Behaviour expands to per-peer `Send`), `Apply`, `BecomeLeader|Follower|Candidate`, `SnapshotNeeded`, `SnapshotInstallComplete`.
+
+**Snapshots:** when applied entries since the last snapshot reach `snapshot_threshold`, the engine emits `SnapshotNeeded { last_applied }`; the app serializes its state machine and calls `compact(last_applied, blob)`, which stores `Snapshot { last_included_index, last_included_term, conf, state_blob }` and truncates the log prefix. A follower whose `next_index` is below the leader's `first_index` receives the snapshot as sequential unary `InstallSnapshot` chunks (`offset`, `data`, `done`); any failure restarts from offset 0. On completion the follower emits `SnapshotInstalled { snapshot }`. See [docs/phase-4.md](docs/phase-4.md).
 
 **Replication:** `next_index` / `match_index`. On reject → **simple decrement**. New followers start with `next_index = leader_last_log_index + 1`, `match_index = 0`.
 
@@ -216,7 +218,7 @@ Legacy env (`RAFT_PEERS`, `RAFT_VOTERS`) still works if no cluster file is prese
 
 ## Status
 
-Phases 1–3 implemented: election over libp2p, log replication, `propose`, and `Event::Committed` (`three_node` commits a command). Next: Phase 4 snapshots.
+Phases 1–4 implemented: election over libp2p, log replication, `propose` / `Event::Committed`, and snapshots (compaction + chunked `InstallSnapshot`). Next: membership change.
 
 ## License
 
