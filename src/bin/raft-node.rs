@@ -22,7 +22,7 @@ use libp2p_raft::cluster_config::{resolve_host_port, ClusterConfig};
 use libp2p_raft::config::{RaftConfig, SeedPeer};
 use libp2p_raft::node_identity::{keypair_for_node, peer_id_for_node};
 use libp2p_raft::raft::types::{EntryType, Role};
-use libp2p_raft::storage::MemoryStorage;
+use libp2p_raft::storage::{FileSnapshotStorage, Storage};
 use libp2p_raft::{Event, RaftBehaviour};
 use tracing_subscriber::EnvFilter;
 
@@ -216,6 +216,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
         seed_peers.len()
     );
 
+    let data_dir = env::var("DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(format!("data/node-{node_id}")));
+    let storage = FileSnapshotStorage::new(&data_dir)?;
+    if let Some(snap) = storage.snapshot() {
+        println!(
+            "loaded snapshot from {}: index={} bytes={}",
+            data_dir.display(),
+            snap.last_included_index,
+            snap.state_blob.len()
+        );
+    }
+
     let cfg = build_config(node_id, voters, seed_peers.clone());
     let mut swarm = SwarmBuilder::with_existing_identity(kp)
         .with_tokio()
@@ -224,7 +237,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             libp2p::noise::Config::new,
             libp2p::yamux::Config::default,
         )?
-        .with_behaviour(|_| RaftBehaviour::new(cfg, MemoryStorage::new()))?
+        .with_behaviour(|_| RaftBehaviour::new(cfg, storage))?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
     swarm.listen_on(listen)?;

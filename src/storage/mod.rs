@@ -1,8 +1,10 @@
 use crate::error::StorageError;
 use crate::raft::types::{HardState, Index, LogEntry, Snapshot, Term};
 
+pub mod file_snapshot;
 pub mod memory;
 
+pub use file_snapshot::FileSnapshotStorage;
 pub use memory::MemoryStorage;
 
 pub trait Storage {
