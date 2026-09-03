@@ -2,12 +2,12 @@
 
 Learning / research crate: a **DIY mini-Raft** exposed as a rust-libp2p **`NetworkBehaviour`**, with a **custom** `ConnectionHandler` and stream protocol `/libp2p-raft/1.0.0`.
 
-> **Not production Raft.** Intentional simplifications: in-memory storage (no disk durability), single-step membership (add/remove one node), simple `next_index` decrement, no OpenRaft.
+> **Not production Raft.** Intentional simplifications: log + hard state in memory (only the snapshot is persisted to disk, via `FileSnapshotStorage`), single-step membership (add/remove one node), simple `next_index` decrement, no OpenRaft.
 
 **Why a custom `ConnectionHandler` instead of `libp2p::request_response`?**  
 Learning goal: understand Behaviour ↔ Handler lifecycle, substream framing, and unary RPC plumbing end-to-end. Production code would often compose `request_response`; we hand-roll it on purpose.
 
-**Docs:** [`docs/architecture.md`](docs/architecture.md)
+**Docs:** [`docs/architecture.md`](docs/architecture.md) · [`docs/diagrams.md`](docs/diagrams.md) (component & data-flow diagrams)
 
 ---
 
@@ -154,6 +154,27 @@ apply_ready()        → committed entries
 
 **Snapshots:** when applied entries since the last snapshot reach `snapshot_threshold`, the engine emits `SnapshotNeeded { last_applied }`; the app serializes its state machine and calls `compact(last_applied, blob)`, which stores `Snapshot { last_included_index, last_included_term, conf, state_blob }` and truncates the log prefix. A follower whose `next_index` is below the leader's `first_index` receives the snapshot as sequential unary `InstallSnapshot` chunks (`offset`, `data`, `done`); any failure restarts from offset 0. On completion the follower emits `SnapshotInstalled { snapshot }`. See [docs/phase-4.md](docs/phase-4.md).
 
+```mermaid
+flowchart TB
+    subgraph compact["Compaction at each node"]
+        A["last_applied − snapshot_base ≥ threshold"] -->|"Event::SnapshotNeeded{last_applied}"| B["App serializes full state<br/>→ state_blob (bytes)"]
+        B -->|"compact(index, blob)"| C["Engine builds Snapshot<br/>{index, term, conf, state_blob}"]
+        C --> D["storage.install_snapshot"]
+        D --> E["truncate log prefix 1..k<br/>first_index = k+1"]
+        D --> F[("write snapshot.bin<br/>.tmp → fsync → rename")]
+    end
+
+    subgraph transfer["Leader → lagging follower"]
+        G["follower next_index<br/>&lt; first_index (log truncated)"] --> H["OutboundTransfer:<br/>64KB chunks, pipeline depth 1"]
+        H -->|"InstallSnapshot{index, term,<br/>offset, data, done}"| I["InboundAssembly:<br/>reassemble by offset"]
+        I -->|"bad offset / index mismatch"| J["reset — expect offset 0"]
+        I -->|"done=true"| K["install_snapshot<br/>+ Event::SnapshotInstalled"]
+        K --> L["App resets state machine<br/>from state_blob"]
+    end
+
+    E -.->|"follower asks for truncated entry"| G
+```
+
 **Replication:** `next_index` / `match_index`. On reject → **simple decrement**. New followers start with `next_index = leader_last_log_index + 1`, `match_index = 0`.
 
 **Membership:** only one Add **or** Remove at a time; reject while pending. Not joint consensus.
@@ -174,7 +195,7 @@ src/
   peer_map.rs · config.rs · error.rs
   protocol/      # messages, codec, upgrade
   raft/          # engine, types, log, snapshot, membership
-  storage/       # trait + MemoryStorage
+  storage/       # trait + MemoryStorage + FileSnapshotStorage (snapshot.bin on disk)
   bin/
     raft-node.rs # deployable single-node binary
 config/
