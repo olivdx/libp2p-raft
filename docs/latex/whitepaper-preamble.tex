@@ -1,0 +1,125 @@
+% Shared preamble for libp2p-raft whitepaper
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage[english]{babel}
+\usepackage[
+  top=2.6cm,
+  bottom=2.6cm,
+  left=2.8cm,
+  right=2.8cm,
+  headheight=14pt
+]{geometry}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{tcolorbox}
+\tcbuselibrary{skins,breakable}
+\usepackage{float}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,decorations.pathreplacing}
+
+\definecolor{brand}{RGB}{0,82,147}
+\definecolor{muted}{RGB}{96,96,96}
+\definecolor{codebg}{RGB}{245,245,248}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=brand,
+  citecolor=brand,
+  urlcolor=brand,
+  pdftitle={libp2p-raft Architecture Whitepaper},
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\textcolor{muted}{libp2p-raft --- Architecture Whitepaper}}
+\fancyhead[R]{\small\textcolor{muted}{\thepage}}
+\renewcommand{\headrulewidth}{0.4pt}
+
+\titleformat{\section}{\large\bfseries\color{brand}}{\thesection}{1em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{1em}{}
+\titleformat{\subsubsection}{\normalsize\bfseries\itshape}{\thesubsubsection}{1em}{}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  columns=fullflexible,
+  frame=single,
+  rulecolor=\color{black!15},
+  backgroundcolor=\color{codebg},
+}
+
+\newtcolorbox{invariantbox}[1][]{
+  enhanced,
+  breakable,
+  colback=brand!5,
+  colframe=brand!55,
+  fonttitle=\bfseries,
+  title=#1,
+  boxrule=0.6pt,
+  arc=2pt,
+}
+
+\newtcolorbox{boundarybox}{
+  enhanced,
+  breakable,
+  colback=black!3,
+  colframe=black!25,
+  title=\textbf{Layer boundary rule},
+  boxrule=0.5pt,
+}
+
+% Inline code: allow a line break after each underscore so long identifiers
+% (e.g. handle_pending_outbound_connection) never overflow the right margin.
+\newcommand{\code}[1]{{\def\_{\textunderscore\allowbreak}\texttt{#1}}}
+
+% Sequence diagrams (TikZ)
+\tikzset{
+  seqactor/.style={draw=brand!60, fill=brand!8, rounded corners=2pt,
+    minimum width=2.3cm, minimum height=0.65cm, font=\small\bfseries,
+    text height=1.7ex, text depth=0.5ex},
+  seqlife/.style={draw=black!30, dashed},
+  seqmsg/.style={-{Stealth[length=2mm]}, semithick, draw=black!80},
+  seqret/.style={-{Stealth[length=2mm]}, semithick, dashed, draw=black!55},
+  seqlbl/.style={above, font=\scriptsize, align=center, fill=white, inner sep=1.2pt},
+  seqnote/.style={draw=black!25, fill=codebg, font=\scriptsize, align=center,
+    inner sep=2.5pt, rounded corners=1pt},
+}
+% \seqactors{y_end}{x1/Label1, x2/Label2, ...}: header boxes + lifelines
+\newcommand{\seqactors}[2]{%
+  \foreach \x/\t in {#2} {%
+    \draw[seqlife] (\x,0) -- (\x,#1);
+    \node[seqactor] at (\x,0) {\t};
+  }}
+% \seqmsg[style]{x_from}{x_to}{y}{label}
+\newcommand{\seqmsg}[5][seqmsg]{\draw[#1] (#2,#4) -- node[seqlbl]{#5} (#3,#4);}
+% \seqnote{x}{y}{text}: local processing on a lifeline
+\newcommand{\seqnote}[3]{\node[seqnote] at (#1,#2) {#3};}
+
+% Table columns: ragged-right paragraph cell of a given width
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+% Width of the last column so a 2-column table fills exactly \linewidth
+\newcommand{\restwidth}[1]{\dimexpr\linewidth-#1-2\tabcolsep\relax}
+
+% Block paragraphs (no first-line indent) and avoid overfull lines from \texttt
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.5em plus 0.2em minus 0.1em}
+\setlength{\emergencystretch}{3em}
+\frenchspacing
+% Lists are code-heavy: ragged-right avoids stretched gaps and overflow
+\setlist{before=\raggedright}
+
+% Full-width abstract, aligned with body text
+\renewenvironment{abstract}{%
+  \begin{center}\bfseries\abstractname\end{center}\vspace{-0.5em}\noindent\ignorespaces
+}{\par\medskip}

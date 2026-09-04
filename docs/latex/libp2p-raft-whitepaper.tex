@@ -1,0 +1,64 @@
+\documentclass[11pt,a4paper]{article}
+\input{whitepaper-preamble.tex}
+
+\newcommand{\WhitepaperTitlePage}{%
+  \begin{titlepage}
+    \centering
+    \vspace*{1.2cm}
+    {\LARGE\bfseries\color{brand} WHITEPAPER\par}
+    \vspace{0.5cm}
+    {\Huge\bfseries libp2p-raft Architecture\par}
+    \vspace{0.35cm}
+    {\Large RaftEngine, RaftBehaviour, RaftHandler\\and rust-libp2p Swarm integration\par}
+    \vspace{1.8cm}
+    {\large HoodLabs --- libp2p-raft\par}
+    \vspace{0.25cm}
+    {\normalsize\textcolor{muted}{Document version 2.0 \quad|\quad \today}\par}
+    \vfill
+    {\small\textcolor{muted}%
+      Detailed technical document for research and experimentation.\\
+      Not a substitute for production operations documentation.\par}
+    \vspace{0.8cm}
+  \end{titlepage}
+}
+
+\begin{document}
+\WhitepaperTitlePage
+
+\begin{abstract}
+\noindent
+This whitepaper describes the \textbf{complete architecture} of the \texttt{libp2p-raft} crate:
+how a Raft state machine is embedded into rust-libp2p through the \texttt{NetworkBehaviour} /
+\texttt{ConnectionHandler} model, module boundaries, runtime data structures, event contracts,
+election/replication/inbound-outbound RPC flows, the wire specification, the failure matrix,
+storage and snapshots, and the event-driven execution model. The content tracks the source in
+\texttt{src/behaviour.rs}, \texttt{src/handler.rs}, \texttt{src/raft/engine.rs},
+\texttt{src/protocol/} and \texttt{src/storage/}.
+\end{abstract}
+
+\noindent\textbf{Keywords:} Raft, libp2p, Swarm, NetworkBehaviour, ConnectionHandler,
+unary RPC, Yamux, hexagonal architecture, correlation ID, snapshot.
+
+\tableofcontents
+\newpage
+
+\input{sections/01-intro-background.tex}
+\input{sections/02-overview-layers.tex}
+\input{sections/03-engine.tex}
+\input{sections/04-behaviour.tex}
+\input{sections/05-handler-protocol.tex}
+\input{sections/06-flows-errors.tex}
+
+\begin{thebibliography}{9}
+\bibitem{ongaro2014raft}
+D.~Ongaro and J.~Ousterhout,
+\newblock In Search of an Understandable Consensus Algorithm,
+\newblock in \emph{Proc.\ USENIX ATC}, 2014.
+
+\bibitem{libp2p}
+Protocol Labs and contributors,
+\newblock \emph{rust-libp2p} --- Swarm, \texttt{NetworkBehaviour},
+\texttt{ConnectionHandler}.
+\end{thebibliography}
+
+\end{document}

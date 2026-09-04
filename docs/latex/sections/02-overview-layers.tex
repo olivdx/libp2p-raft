@@ -1,0 +1,54 @@
+\section{Layered architecture overview}
+
+\subsection{Responsibilities}
+
+\begin{center}
+\begin{tabular}{@{}L{0.17\linewidth}L{0.22\linewidth}L{\dimexpr0.61\linewidth-4\tabcolsep\relax}@{}}
+\toprule
+\textbf{Layer} & \textbf{File / type} & \textbf{Responsibility} \\
+\midrule
+Application & \code{bin/raft-node.rs} & \code{SwarmBuilder}, \code{listen\_on}, dial seeds, \code{propose}, snapshot compaction, \code{select\_next\_some} \\
+Swarm & libp2p & Transport, pool, polling behaviour + handlers \\
+\code{RaftBehaviour} & \code{behaviour.rs} & Engine, \code{PeerMap}, \code{pending}, \code{inbound\_channels}, \code{Sleep}, \code{execute\_actions} \\
+\code{RaftHandler} & \code{handler.rs} & Substreams, codec, concurrent I/O \\
+\code{RaftEngine} & \code{raft/engine.rs} & Election, replication, commit, membership logic \\
+\code{Storage} & \code{storage/} & Hard state, log, snapshot API \\
+Protocol & \code{protocol/} & \code{RaftMessage}, \code{WireEnvelope}, codec, upgrade \\
+\code{PeerMap} & \code{peer\_map.rs} & \code{NodeId} $\leftrightarrow$ \code{PeerId}, seed multiaddrs \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{What libp2p provides vs.\ what we write}
+
+Only \textbf{four} pieces are implemented for Raft networking: (1) \code{RaftBehaviour}, (2) \code{RaftHandler}, (3) protocol + codec, (4) \code{PeerMap}. Everything else is libp2p: Swarm, TCP/Noise/Yamux, multistream-select.
+
+\subsection{Byte stack (application down to the wire)}
+
+\begin{center}
+\begin{tabular}{@{}L{0.28\linewidth}L{\restwidth{0.28\linewidth}}@{}}
+\toprule
+\textbf{Layer} & \textbf{Content} \\
+\midrule
+Raft logic & \code{RaftMessage} inside \code{WireEnvelope} \\
+Framing & \code{u32} BE length + bincode payload \\
+Substream & multistream-select \code{/libp2p-raft/1.0.0} \\
+Multiplex & Yamux \\
+Security & Noise (\code{PeerId}) \\
+Transport & TCP (multiaddr) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Invariant along the consensus path}
+
+Along \code{propose} $\rightarrow$ replicate $\rightarrow$ commit, the message shape stays \code{RaftMessage} from the engine to bincode; only the behaviour/handler add \code{correlation\_id} and framing. Storage does not influence the wire shape.
+
+\section{Execution and threading model}
+
+\begin{itemize}[nosep]
+  \item \textbf{One} Swarm event loop (tokio) per process.
+  \item \code{RaftEngine} is called \textbf{synchronously} from \code{poll}, \code{on\_connection\_handler\_event} and \code{propose} --- there is no separate consensus thread.
+  \item The handler polls \code{FuturesUnordered} --- substream I/O runs concurrently within the same connection task.
+  \item Engine deadlines are absolute \code{Instant}s; the behaviour calls \code{arm\_sleep(min(engine, rpc\_timeouts))}.
+\end{itemize}

@@ -1,0 +1,64 @@
+\section{RaftEngine --- a pure state machine}
+
+\subsection{Public API}
+
+\code{RaftEngine<S: Storage>} does not import libp2p. Its synchronous surface:
+
+\begin{itemize}[nosep]
+  \item \code{tick(now)} --- election or heartbeat deadline; returns \code{TickOutcome \{ actions, next\_deadline \}}.
+  \item \code{handle\_rpc(from, msg, now)} --- process an inbound RPC; returns \code{Vec<Action>}.
+  \item \code{handle\_rpc\_failure(to, kind)} --- clears \code{ae\_inflight} when an AppendEntries RPC fails (and aborts an in-progress snapshot transfer).
+  \item \code{propose(data)} --- leader appends an entry; returns the index + replication actions.
+  \item \code{compact(index, blob)} --- store a snapshot and compact the log prefix.
+  \item \code{next\_deadline()}, \code{role()}, \code{commit\_index()}, \ldots
+\end{itemize}
+
+\subsection{Action types}
+
+\begin{center}
+\begin{tabular}{@{}L{0.36\linewidth}L{\restwidth{0.36\linewidth}}@{}}
+\toprule
+\textbf{Action} & \textbf{Meaning} \\
+\midrule
+\code{Send \{ to, msg \}} & Send an RPC to one \code{NodeId} \\
+\code{Broadcast \{ msg \}} & Behaviour fans out to every other voter \\
+\code{Apply \{ entries \}} & Committed entries --- apply to the state machine \\
+\code{BecomeLeader} / \code{Follower} / \code{Candidate} & Role change (event for the app) \\
+\code{SnapshotNeeded} / \code{SnapshotInstallComplete} & Snapshot hooks (app + storage) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Key internal state}
+
+\begin{itemize}[nosep]
+  \item \code{role}, \code{leader}, \code{votes} --- election.
+  \item \code{next\_index}, \code{match\_index} --- leader replication per follower.
+  \item \code{ae\_inflight: HashSet<NodeId>} --- \textbf{pipeline depth 1}: no further AppendEntries is sent to a peer until a response or a failure arrives.
+  \item \code{last\_ae} --- remembers the most recently sent prefix (for reject handling).
+  \item \code{election\_deadline}, \code{heartbeat\_deadline} --- absolute \code{Instant}s.
+  \item \code{membership} --- the voter set; quorum $\lfloor n/2 \rfloor + 1$.
+  \item \code{snap\_out}, \code{snap\_in} --- outbound/inbound snapshot transfer state.
+\end{itemize}
+
+\subsection{The \code{tick} flow}
+
+\textbf{Follower/Candidate:} if \code{now >= election\_deadline} $\rightarrow$ \code{start\_election}: increment term, persist the self-vote, \code{Broadcast RequestVote}.
+
+\textbf{Leader:} if \code{now >= heartbeat\_deadline} $\rightarrow$ \code{replicate\_actions()} (AppendEntries to each voter via \code{send\_append\_entries\_to}), reset the heartbeat deadline.
+
+\code{next\_deadline()} = min(heartbeat, election) on the leader; followers only have the election deadline.
+
+\subsection{Replication and commit}
+
+\code{build\_append\_entries(to)} builds \code{prev\_log\_*} and the entry slice from \code{next\_index[to]}. Success $\rightarrow$ update \code{match\_index}; reject $\rightarrow$ decrement \code{next\_index} (no conflict-index hint). If \code{next\_index[to]} falls below \code{first\_index}, the leader switches to \code{InstallSnapshot}. \code{maybe\_commit} scans from high to low: only entries from the leader's \textbf{current term} may be committed by a majority \code{match\_index}.
+
+\subsection{RequestVote and AppendEntries (logic)}
+
+Inbound \code{RequestVote}: reject if \code{term < current\_term}; if \code{term > current} $\rightarrow$ \code{become\_follower}; grant if not yet voted (or voted for the same candidate) and the candidate's log is up to date. Always reply with \code{RequestVoteResp} via \code{Action::Send \{ to: from, \ldots \}}.
+
+Inbound \code{AppendEntries}: check term and log consistency, append entries, update \code{commit\_index} from \code{leader\_commit}, reply with \code{AppendEntriesResp}.
+
+\begin{invariantbox}[The engine knows nothing about the network]
+Every \code{Action::Send} carries only a \code{NodeId}. The behaviour decides about dialing, \code{PeerId}s and unary substreams.
+\end{invariantbox}

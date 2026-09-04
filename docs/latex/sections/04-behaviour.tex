@@ -1,0 +1,79 @@
+\section{RaftBehaviour --- the NetworkBehaviour adapter}
+
+\subsection{Networking state}
+
+\begin{center}
+\begin{tabular}{@{}L{0.28\linewidth}L{\restwidth{0.28\linewidth}}@{}}
+\toprule
+\textbf{Field} & \textbf{Role} \\
+\midrule
+\code{engine} & The pure \code{RaftEngine} \\
+\code{peer\_map} & Static map built from \code{seed\_peers} \\
+\code{connected} & \code{PeerId} $\rightarrow$ \code{Set<ConnectionId>} \\
+\code{dialing} & Avoids dial spam \\
+\code{dial\_backoff\_until} & Backoff after transport errors \\
+\code{pending} & \code{correlation\_id} $\rightarrow$ \code{PendingRequest} (outbound awaiting a response) \\
+\code{inbound\_channels} & \code{channel\_id} $\rightarrow$ \code{InboundChannel} (inbound reply) \\
+\code{pending\_events} & Queue of \code{ToSwarm} \\
+\code{sleep} & Timer until \code{earliest\_wake} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\code{PendingRequest} stores \code{to}, \code{peer}, \code{kind} (\code{RequestVote} / \code{AppendEntries} / snapshot), \code{sent\_at}, and a copy of \code{msg}.
+
+\subsection{NetworkBehaviour callbacks}
+
+\begin{center}
+\begin{tabular}{@{}L{0.36\linewidth}L{\restwidth{0.36\linewidth}}@{}}
+\toprule
+\textbf{Method} & \textbf{RaftBehaviour} \\
+\midrule
+\code{handle\_pending\_outbound\_connection} & Returns multiaddrs from \code{PeerMap} for dialing \\
+\code{handle\_established\_*\_connection} & Returns \code{RaftHandler::new()} \\
+\code{on\_swarm\_event} & Updates \code{connected}/\code{dialing}; connection closed $\rightarrow$ \code{fail\_peer\_pending} \\
+\code{on\_connection\_handler\_event} & Dispatches \code{ToBehaviour::Request/Response/Failure} \\
+\code{poll} & Drains events, RPC timeouts, \code{tick}, \code{Sleep} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{\code{execute\_actions}}
+
+Loop over each \code{Action}:
+\begin{itemize}[nosep]
+  \item \code{Send}: if \code{inbound\_from = Some((from, channel\_id))} and \code{to == from} $\rightarrow$ \code{SendResponse} + \code{NotifyHandler::One(conn)}; otherwise \code{send\_rpc}.
+  \item \code{Broadcast}: \code{send\_rpc} to each of \code{other\_voters()}.
+  \item Role / Apply / Snapshot $\rightarrow$ \code{GenerateEvent}.
+\end{itemize}
+
+\subsection{\code{send\_rpc}}
+
+\begin{enumerate}[label=\arabic*., nosep]
+  \item \code{peer\_map.peer\_id(to)} --- unknown $\rightarrow$ \code{handle\_rpc\_failure}, \code{RpcFailed}.
+  \item Not \code{is\_connected(peer)} $\rightarrow$ failure + \code{dial\_seed} (lossy; no RpcFailed is emitted on the AE retry path).
+  \item Allocate a \code{correlation\_id}, \code{pending.insert}, queue \code{NotifyHandler::Any} + \code{SendRequest}.
+\end{enumerate}
+
+\subsection{Public events for the application}
+
+\code{RoleChanged}, \code{Committed}, \code{PeerMapped} (startup), \code{SnapshotNeeded}, \code{SnapshotInstalled}, \code{RpcFailed}.
+
+\section{\code{RaftBehaviour::poll} ordering}
+
+\begin{enumerate}[label=\textbf{B\arabic*.}, nosep]
+  \item Pop \code{pending\_events} $\rightarrow$ \code{Poll::Ready(ToSwarm)}.
+  \item Scan \code{pending} for entries past \code{rpc\_timeout} $\rightarrow$ \code{fail\_pending} $\rightarrow$ engine \code{handle\_rpc\_failure}.
+  \item If \code{now >= engine.next\_deadline()} $\rightarrow$ \code{tick} + \code{execute\_actions}.
+  \item Poll \code{Sleep}; Ready $\rightarrow$ re-arm \code{earliest\_wake} and loop; Pending $\rightarrow$ return.
+\end{enumerate}
+
+The next wake-up deadline:
+\begin{lstlisting}
+earliest_wake = min(
+    engine.next_deadline(),
+    min_pending(sent_at + rpc_timeout),
+)
+\end{lstlisting}
+
+\code{pending\_events} are drained \textbf{first} so that Dial/NotifyHandler/Event are not starved under load.

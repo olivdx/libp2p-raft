@@ -1,0 +1,369 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage[english]{babel}
+\usepackage[
+  top=2.8cm,
+  bottom=2.8cm,
+  left=3cm,
+  right=3cm,
+  headheight=14pt
+]{geometry}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{float}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{tcolorbox}
+\tcbuselibrary{skins,breakable}
+
+\definecolor{brand}{RGB}{0,82,147}
+\definecolor{muted}{RGB}{96,96,96}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=brand,
+  citecolor=brand,
+  urlcolor=brand,
+  pdftitle={libp2p-raft Whitepaper},
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\textcolor{muted}{libp2p-raft Whitepaper}}
+\fancyhead[R]{\small\textcolor{muted}{\thepage}}
+\renewcommand{\headrulewidth}{0.4pt}
+
+\titleformat{\section}{\large\bfseries\color{brand}}{\thesection}{1em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{1em}{}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  columns=fullflexible,
+  frame=single,
+  rulecolor=\color{black!15},
+  backgroundcolor=\color{black!3},
+}
+
+\newtcolorbox{designbox}[1][]{
+  enhanced,
+  breakable,
+  colback=brand!4,
+  colframe=brand!60,
+  fonttitle=\bfseries,
+  title=#1,
+  boxrule=0.6pt,
+  arc=2pt,
+}
+
+% --- Title block (whitepaper style) ---
+\newcommand{\WhitepaperTitle}{%
+  \begin{titlepage}
+    \centering
+    \vspace*{1.5cm}
+    {\LARGE\bfseries\color{brand} WHITEPAPER\par}
+    \vspace{0.6cm}
+    {\Huge\bfseries A minimal Raft consensus layer\\on rust-libp2p\par}
+    \vspace{0.4cm}
+    {\large\textit{libp2p-raft --- Swarm, Behaviour, Handler architecture}\par}
+    \vspace{2cm}
+    {\large HoodLabs / libp2p-raft\par}
+    \vspace{0.3cm}
+    {\normalsize\textcolor{muted}{Document version: 1.0 \quad|\quad \today}\par}
+    \vfill
+    {\small\textcolor{muted}%
+      This document describes a research and experimentation design.\\
+      It is not intended for production deployment.\par}
+  \end{titlepage}
+}
+
+% Block paragraphs (no first-line indent) and avoid overfull lines from \texttt
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.5em plus 0.2em minus 0.1em}
+\setlength{\emergencystretch}{3em}
+\frenchspacing
+% Lists are code-heavy: ragged-right avoids stretched gaps and overflow
+\setlist{before=\raggedright}
+
+% Full-width abstract, aligned with body text
+\renewenvironment{abstract}{%
+  \begin{center}\bfseries\abstractname\end{center}\vspace{-0.5em}\noindent\ignorespaces
+}{\par\medskip}
+
+% Inline code: allow a line break after each underscore
+\newcommand{\code}[1]{{\def\_{\textunderscore\allowbreak}\texttt{#1}}}
+
+\begin{document}
+\WhitepaperTitle
+
+\begin{abstract}
+\noindent
+We present \emph{libp2p-raft}: a research implementation that embeds a simple Raft state machine
+into a rust-libp2p \code{NetworkBehaviour}. The design separates \textbf{RaftEngine}
+(pure logic, synchronous, no I/O) from \textbf{RaftBehaviour} (the network adapter: maps
+\code{NodeId} $\leftrightarrow$ \code{PeerId}, manages asynchronous RPCs) and
+\textbf{RaftHandler} (one instance per connection, unary framed RPC over the
+\code{/libp2p-raft/1.0.0} substream). The libp2p Swarm orchestrates transports, the connection
+pool and the event loop; behaviour and handler never call each other directly.
+
+The paper states the architectural goals, the trust model, the wire format, the control flows
+(leader election, replication, inbound reply), the event-driven execution model, and the
+deliberate limitations compared with production Raft. It is intended as a reference for learning
+and experimenting with combining consensus and a modern P2P stack.
+\end{abstract}
+
+\noindent\textbf{Keywords:} Raft, libp2p, rust-libp2p, Swarm, NetworkBehaviour,
+ConnectionHandler, distributed consensus, unary RPC.
+
+\tableofcontents
+\newpage
+
+\section{Introduction}
+
+A replicated state machine needs a consensus protocol so that processes agree on an ordered
+history of commands despite network failures or crashes. Raft~\cite{ongaro2014raft} splits the
+problem into leader election, log replication and safety invariants that are easier to implement
+than Paxos. In parallel, libp2p~\cite{libp2p} provides a modular networking stack: transport
+upgrades, cryptographic identity, substream multiplexing --- applications express protocols via
+\code{NetworkBehaviour} and \code{ConnectionHandler} instead of raw sockets.
+
+\code{libp2p-raft} explores a two-layer \emph{composition}: a hand-written Raft engine owned by
+\code{RaftBehaviour}, which neither dials nor serializes by itself; byte framing lives in
+\code{RaftHandler}. The library does not own the \code{Swarm}: the host application assembles
+TCP, Noise and Yamux via \code{SwarmBuilder} and attaches \code{RaftBehaviour}.
+
+\section{Problem and design goals}
+
+\subsection{Problem}
+
+Given a fixed set of voters (static configuration), the nodes must:
+\begin{enumerate}[label=\roman*., nosep]
+  \item elect at most one leader per term;
+  \item replicate the command log from the leader;
+  \item commit and apply the same log prefix on a majority;
+  \item communicate over an authenticated (Noise) and multiplexed (Yamux) P2P network.
+\end{enumerate}
+
+\subsection{Architectural goals}
+
+\begin{designbox}[Design principles]
+\begin{itemize}[nosep]
+  \item \textbf{Separate engine and network:} the engine only receives ticks, logical RPCs and
+        proposals, and returns \code{Action}s --- no \code{PeerId}, no stream handles.
+  \item \textbf{Unary RPC over substreams:} each RPC opens a substream, exchanges one
+        request/response, and closes it --- avoiding head-of-line blocking between unrelated RPCs.
+  \item \textbf{The Swarm is the intermediary:} behaviour $\leftrightarrow$ handler via
+        \code{FromBehaviour} / \code{ToBehaviour}; no direct calls.
+  \item \textbf{Lost connection $\neq$ lost membership:} quorum follows the voter configuration;
+        redials and RPC timeouts never remove a voter.
+\end{itemize}
+\end{designbox}
+
+\subsection{Out of scope}
+
+The implementation does \textbf{not} target production: storage may be in-memory or a simple
+file; AppendEntries pipelining is limited to depth 1; joint consensus and full snapshot support are
+incomplete. The value lies in the \emph{layering} and the Behaviour--Handler lifecycle.
+
+\section{System overview}
+
+\subsection{Layers}
+
+\begin{table}[H]
+\centering
+\caption{Layer responsibilities}
+\begin{tabularx}{\textwidth}{@{}lY@{}}
+\toprule
+\textbf{Layer} & \textbf{Responsibility} \\
+\midrule
+Application / Swarm & Build transports, \code{listen\_on}, dial seeds, \code{propose}, receive
+\code{SwarmEvent::Behaviour} \\
+\code{RaftBehaviour} & Engine, \code{PeerMap}, \code{pending}, \code{inbound\_channels},
+timer, \code{execute\_actions} \\
+\code{RaftHandler} & Substreams, negotiate \code{/libp2p-raft/1.0.0}, encode/decode frames \\
+\code{RaftEngine} & \code{tick}, \code{handle\_rpc}, election, replication, commit \\
+\code{Storage} & Hard state, log, (snapshot) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{The Swarm in libp2p}
+
+The \textbf{Swarm} is the node-level event loop: it owns transports, listeners, dialing and the
+connection pool (one \code{ConnectionHandler} per connection). The name \emph{swarm} evokes a P2P
+swarm of peers --- a node managing a dynamic set of connections, not one fixed client--server channel.
+
+The application drives \code{swarm.select\_next\_some()}. The Swarm polls the behaviour and the
+handlers; Raft logic does not run inside the Swarm.
+
+\subsection{Logical flow diagram}
+
+\noindent\fbox{\parbox{\dimexpr\textwidth-2\fboxsep-2\fboxrule\relax}{\small\ttfamily
+App $\rightarrow$ propose / events\\
+\quad $\downarrow$\\
+Swarm $\leftrightarrow$ RaftBehaviour $\leftrightarrow$ RaftEngine $\leftrightarrow$ Storage\\
+\quad $\downarrow$ NotifyHandler / HandlerEvent\\
+RaftHandler $\leftrightarrow$ Yamux substream $\leftrightarrow$ peer
+}}
+
+\section{Behaviour and Handler interfaces}
+
+\subsection{Associated types}
+
+The \code{ConnectionHandler} trait requires two message types (the project defines their content):
+
+\begin{itemize}[nosep]
+  \item \code{FromBehaviour}: behaviour $\rightarrow$ handler --- \code{SendRequest},
+        \code{SendResponse}.
+  \item \code{ToBehaviour}: handler $\rightarrow$ behaviour --- \code{Request},
+        \code{Response}, \code{Failure}.
+\end{itemize}
+
+\subsection{Outbound and inbound unary}
+
+\textbf{Outbound:}
+\begin{enumerate}[label=\arabic*., nosep]
+  \item The behaviour calls \code{send\_rpc} $\rightarrow$ \code{SendRequest}.
+  \item The handler opens an \emph{outbound substream} on the connection to the peer.
+  \item It writes the frame and reads the response $\rightarrow$ \code{ToBehaviour::Response}.
+\end{enumerate}
+
+\textbf{Inbound:}
+\begin{enumerate}[label=\arabic*., nosep]
+  \item The peer opens a substream; the handler reads the frame.
+  \item \code{ToBehaviour::Request} with a \code{channel\_id} $\rightarrow$ the engine processes it.
+  \item The reply goes back via \code{SendResponse} on the \emph{same} substream.
+\end{enumerate}
+
+\subsection{Replying on the same connection: \code{to == from}}
+
+When \code{execute\_actions} is called with \code{Some((from, channel\_id))}:
+\begin{itemize}[nosep]
+  \item If \code{Action::Send \{ to, msg \}} has \code{to == from}, the behaviour uses
+    \code{NotifyHandler::One(connection\_id)} and \code{SendResponse} --- no new outbound RPC is opened.
+  \item \code{inbound\_channels} stores \code{channel\_id} $\rightarrow$ \code{\{peer, conn, correlation\_id\}}.
+\end{itemize}
+
+\code{NotifyHandler::Any} is only for new outbound RPCs: the Swarm picks \textbf{one} connection
+to the peer. \code{pending} maps the \code{correlation\_id} of RPCs \textbf{we sent} that are
+awaiting a response.
+
+\section{Wire protocol specification}
+
+\subsection{Substream identifier}
+
+Multistream-select negotiates the protocol:
+\begin{lstlisting}
+/libp2p-raft/1.0.0
+\end{lstlisting}
+
+\subsection{Framing}
+
+Each message on a substream:
+\begin{enumerate}[nosep]
+  \item a 4-byte payload length, big-endian (\code{u32});
+  \item the payload \code{bincode(WireEnvelope)} with
+        \code{WireEnvelope \{ correlation\_id, msg \}};
+  \item \code{msg}: a \code{RaftMessage} variant (RequestVote, AppendEntries, snapshot, ...).
+\end{enumerate}
+
+The handler enforces a frame size limit (e.g.\ 4\,MiB). A Raft heartbeat is an
+\code{AppendEntries} with empty \code{entries}.
+
+\subsection{In-memory decoding}
+
+\code{decode\_envelope} wraps the \code{\&[u8]} in a \code{std::io::Cursor} to read the length
+prefix through the \code{Read} API, then deserializes the rest --- no file involved.
+
+\section{Consensus control flows}
+
+\subsection{Leader election}
+
+Follower/Candidate: \code{election\_timeout} expires $\rightarrow$ \code{engine.tick} $\rightarrow$
+increment term, vote for self, \code{Broadcast RequestVote} $\rightarrow$ the behaviour opens an RPC to
+each voter. Majority $\rightarrow$ \code{BecomeLeader}, initialise \code{next\_index} /
+\code{match\_index}, start heartbeats.
+
+\subsection{Heartbeat and replication}
+
+Only the \textbf{Leader} sends \code{AppendEntries} every \code{heartbeat\_interval} via
+\code{replicate\_actions}. The engine emits actions $\rightarrow$ behaviour \code{send\_rpc}
+$\rightarrow$ handler. Followers reset their election timeout on each heartbeat.
+
+\subsection{Proposing and committing commands}
+
+Leader: \code{propose(data)} persists the entry $\rightarrow$ replication $\rightarrow$ majority
+\code{match\_index} $\rightarrow$ \code{commit\_index} $\rightarrow$ \code{Apply} $\rightarrow$
+a \code{Committed} event for the application.
+
+\subsection{Timeouts and transport errors}
+
+An outbound RPC past \code{rpc\_timeout}: fail the pending entry, the engine clears
+\code{ae\_inflight}; retries happen implicitly through tick/election/heartbeat. Dial failure:
+backoff, never treated as removing a voter.
+
+\section{Execution model}
+
+A single Swarm event loop (tokio). The engine is called \textbf{synchronously} from the behaviour ---
+there is no separate consensus thread. The handler polls many substream I/O operations concurrently
+(\code{FuturesUnordered}); the engine remains sequential. Responses may arrive out of send order;
+they are matched by \code{correlation\_id}.
+
+The behaviour arms a \code{Sleep} until the earliest deadline (engine or pending RPC) and only
+calls \code{tick} when it is due.
+
+\section{Identity and bootstrap}
+
+\begin{itemize}[nosep]
+  \item \code{NodeId} (\code{u64}): Raft membership, fixed in the cluster config.
+  \item \code{PeerId}: libp2p identity from a keypair; the seed list maps \code{NodeId} $\leftrightarrow$
+        \code{PeerId} + multiaddr.
+  \item Voters must be configured before the first election timeout. No DHT/gossip is required for a
+        minimal deployment.
+\end{itemize}
+
+\section{Limitations and implementation status}
+
+\begin{table}[H]
+\centering
+\caption{Compared with production Raft}
+\begin{tabularx}{\textwidth}{@{}lY@{}}
+\toprule
+\textbf{Implemented} & Election, replication, propose, commit events, multi-node example \\
+\textbf{Limitations} & AE pipeline depth 1; reject $\rightarrow$ simple \code{next\_index} decrement;
+durability depends on \code{Storage}; full snapshot/membership support incomplete \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{Conclusion}
+
+\code{libp2p-raft} illustrates a layered architecture: Raft invariants in a pure engine, rust-libp2p
+providing authenticated and multiplexed connections, and an adapter that uses correlation IDs, a peer
+map and deadline-driven ticks, and distinguishes loss of connectivity from membership change. Within
+the simplified scope described, the design is a compact laboratory for studying how to map a consensus
+state machine onto a modern P2P stack.
+
+\begin{thebibliography}{9}
+\bibitem{ongaro2014raft}
+D.~Ongaro and J.~Ousterhout,
+\newblock In Search of an Understandable Consensus Algorithm,
+\newblock in \emph{Proc.\ USENIX ATC}, 2014.
+
+\bibitem{libp2p}
+Protocol Labs and contributors,
+\newblock \emph{rust-libp2p} --- Swarm, \code{NetworkBehaviour},
+\code{ConnectionHandler}.
+\end{thebibliography}
+
+\end{document}

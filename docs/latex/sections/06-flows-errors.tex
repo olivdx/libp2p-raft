@@ -1,0 +1,164 @@
+\section{End-to-end control flows}
+
+The four sequence diagrams below share one convention: each column is a component, a solid arrow
+is a call or message, a dashed arrow is a return value or response, and a grey box is local
+processing.
+
+\subsection{Inbound RPC (peer $\rightarrow$ us)}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\seqactors{-5.6}{0/Peer, 4.2/RaftHandler, 8.4/RaftBehaviour, 12.6/RaftEngine}
+\seqmsg{0}{4.2}{-0.85}{open substream, send \code{WireEnvelope}}
+\seqmsg{4.2}{8.4}{-1.5}{\code{ToBehaviour::Request}}
+\seqnote{8.4}{-2.25}{\code{PeerId} $\rightarrow$ \code{NodeId}\\ \code{inbound\_channels.insert}}
+\seqmsg{8.4}{12.6}{-3.05}{\code{handle\_rpc(from, msg, now)}}
+\seqmsg[seqret]{12.6}{8.4}{-3.7}{\code{Send \{ to: from \}}}
+\seqmsg{8.4}{4.2}{-4.65}{\code{NotifyHandler::One}\\ \code{SendResponse}}
+\seqmsg[seqret]{4.2}{0}{-5.3}{response frame, close substream}
+\end{tikzpicture}
+\caption{Inbound RPC: the reply travels on the \emph{same} substream that carried the request.}
+\end{figure}
+
+\begin{enumerate}[label=\arabic*., nosep]
+  \item The peer opens an inbound substream; the handler reads the \code{WireEnvelope}.
+  \item \code{ToBehaviour::Request} + \code{channel\_id}; a oneshot waits for the response.
+  \item Behaviour: \code{PeerId} $\rightarrow$ \code{NodeId}; \code{inbound\_channels.insert}.
+  \item \code{engine.handle\_rpc(from, msg, now)} $\rightarrow$ actions (usually a \code{Send} back to \code{from}).
+  \item \code{execute\_actions} with \code{Some((from, channel\_id))} $\rightarrow$ \code{SendResponse} + \code{NotifyHandler::One}.
+  \item The handler writes the frame and closes the unary substream.
+  \item If the engine does not reply to \code{from}: the behaviour calls \code{remove(channel\_id)} to avoid a leak.
+\end{enumerate}
+
+\subsection{Outbound RPC (us $\rightarrow$ peer)}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\seqactors{-6.25}{0/Peer, 4.2/RaftHandler, 8.4/RaftBehaviour, 12.6/RaftEngine}
+\seqmsg{12.6}{8.4}{-0.85}{\code{Action::Send \{ to, msg \}}}
+\seqnote{8.4}{-1.6}{\code{send\_rpc}: map peer, connected?\\ \code{pending.insert(cid)}}
+\seqmsg{8.4}{4.2}{-2.7}{\code{NotifyHandler::Any}\\ \code{SendRequest}}
+\seqmsg{4.2}{0}{-3.35}{open substream, write request}
+\seqmsg[seqret]{0}{4.2}{-4.0}{response frame}
+\seqmsg{4.2}{8.4}{-4.65}{\code{ToBehaviour::Response}}
+\seqnote{8.4}{-5.25}{\code{pending.remove(cid)}}
+\seqmsg{8.4}{12.6}{-5.95}{\code{handle\_rpc(to, msg)}}
+\end{tikzpicture}
+\caption{Outbound RPC: the response is matched to its request by \code{correlation\_id} (cid).}
+\end{figure}
+
+\begin{enumerate}[label=\arabic*., nosep]
+  \item The engine emits \code{Action::Send}, or a \code{Broadcast} is fanned out.
+  \item \code{send\_rpc}: map the peer, check connectivity, \code{pending.insert(correlation\_id)}.
+  \item \code{NotifyHandler::Any} + \code{SendRequest}.
+  \item The handler opens an outbound substream, writes and reads.
+  \item \code{ToBehaviour::Response} $\rightarrow$ \code{pending.remove} $\rightarrow$ \code{handle\_rpc(pending.to, msg)}.
+\end{enumerate}
+
+Not connected: dial + \code{handle\_rpc\_failure} (lossy); the election/heartbeat tick retries later.
+
+\subsection{Election}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\seqactors{-8.5}{0/Engine A, 4.2/Behaviour A, 8.4/Node B, 12.6/Node C}
+\seqmsg{4.2}{0}{-0.85}{\code{tick(now)}}
+\seqnote{0}{-1.75}{deadline expired\\ term$+1$, vote for self\\ $\rightarrow$ Candidate}
+\seqmsg[seqret]{0}{4.2}{-2.75}{\code{Broadcast RequestVote}}
+\seqmsg{4.2}{8.4}{-3.4}{\code{RequestVote} (cid 1)}
+\seqmsg{4.2}{12.6}{-4.05}{\code{RequestVote} (cid 2)}
+\seqmsg[seqret]{8.4}{4.2}{-4.7}{\code{RequestVoteResp} granted}
+\seqmsg{4.2}{0}{-5.35}{\code{handle\_rpc(B, resp)}}
+\seqnote{0}{-6.1}{2/3 votes\\ = majority\\ $\rightarrow$ \code{BecomeLeader}}
+\seqmsg[seqret]{0}{4.2}{-7.1}{\code{Broadcast AppendEntries}}
+\seqmsg{4.2}{8.4}{-7.7}{heartbeat}
+\seqmsg{4.2}{12.6}{-8.25}{heartbeat}
+\end{tikzpicture}
+\caption{Election in a 3-node cluster: A wins with its own vote and B's vote.}
+\end{figure}
+
+\begin{enumerate}[label=\arabic*., nosep]
+  \item A follower's timeout expires $\rightarrow$ \code{tick} $\rightarrow$ it becomes a candidate.
+  \item \code{Broadcast RequestVote} $\rightarrow$ the behaviour calls \code{send\_rpc} N times.
+  \item Responses are matched by \code{correlation\_id}.
+  \item Majority reached $\rightarrow$ \code{BecomeLeader}, initialise \code{next\_index}, start heartbeats.
+\end{enumerate}
+
+\subsection{Propose $\rightarrow$ commit}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\seqactors{-7.3}{0/Application, 4.2/RaftBehaviour, 8.4/RaftEngine, 12.6/Followers}
+\seqmsg{0}{4.2}{-0.85}{\code{propose(data)}}
+\seqmsg{4.2}{8.4}{-1.5}{\code{propose(data)}}
+\seqnote{8.4}{-2.1}{append + persist entry}
+\seqmsg[seqret]{8.4}{4.2}{-2.8}{index + \code{Send AppendEntries}}
+\seqmsg{4.2}{12.6}{-3.45}{\code{AppendEntries} (respecting \code{ae\_inflight})}
+\seqmsg[seqret]{12.6}{4.2}{-4.1}{\code{AppendEntriesResp} success}
+\seqmsg{4.2}{8.4}{-4.75}{\code{handle\_rpc(f, resp)}}
+\seqnote{8.4}{-5.5}{update \code{match\_index}\\ majority $\rightarrow$ \code{commit\_index}}
+\seqmsg[seqret]{8.4}{4.2}{-6.3}{\code{Action::Apply}}
+\seqmsg{4.2}{0}{-6.95}{\code{Event::Committed}}
+\end{tikzpicture}
+\caption{Propose $\rightarrow$ commit: an entry is applied once a majority has replicated it.}
+\end{figure}
+
+\begin{enumerate}[label=\arabic*., nosep]
+  \item The app calls \code{propose} $\rightarrow$ the engine persists the entry.
+  \item The engine emits replication actions $\rightarrow$ AppendEntries per follower (respecting \code{ae\_inflight}).
+  \item \code{AppendEntriesResp} success $\rightarrow$ update \code{match\_index}.
+  \item Majority reached $\rightarrow$ advance \code{commit\_index}, \code{Apply} $\rightarrow$ \code{Event::Committed}.
+\end{enumerate}
+
+\section{Failure matrix and edge cases}
+
+\begin{center}
+\begin{tabular}{@{}L{0.30\linewidth}L{\restwidth{0.30\linewidth}}@{}}
+\toprule
+\textbf{Situation} & \textbf{Behaviour} \\
+\midrule
+Not connected on Send & Dial + \code{handle\_rpc\_failure}; AE in-flight cleared; tick retries \\
+RPC timeout & \code{fail\_pending}; that RPC is not retried directly \\
+Connection closed & \code{fail\_peer\_pending} for the peer \\
+Dial failure & Backoff + \code{RpcFailed} (depending on the path) \\
+Unknown \code{PeerId} & \code{RpcFailed}; the engine is not called \\
+Stale term & Engine ignores / steps down per Raft rules \\
+Multiple connections to one peer & Inbound reply must use \code{One(conn)}; outbound \code{Any} picks one \\
+Out-of-order responses & Matched by \code{correlation\_id}; no FIFO assumption \\
+Connection drop & Voter is \textbf{not} removed; quorum follows the config \\
+Membership change & Only through the log (planned; \code{EntryType} currently has only \code{Command}) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\input{sections/07-storage-snapshot.tex}
+
+\section{Module map of the crate}
+
+\code{lib.rs} exports behaviour, handler, engine, protocol, storage and config. Suggested reading order:
+\begin{enumerate}[label=\arabic*., nosep]
+  \item \code{raft/types.rs}
+  \item \code{engine.rs} --- tick, election, AE
+  \item \code{behaviour.rs} --- \code{execute\_actions}, \code{poll}
+  \item \code{handler.rs} --- unary I/O
+  \item \code{storage/}, \code{raft/snapshot.rs} --- persistence and snapshots
+  \item \code{bin/raft-node.rs} --- Swarm loop
+\end{enumerate}
+
+\section{Deliberate limitations and status}
+
+\textbf{Implemented:} election over libp2p, replication, propose, commit events, chunked snapshot install, a multi-node example, engine tests without a Swarm.
+
+\textbf{Missing / simplified:} AE pipeline $>$ 1; conflict-index optimisation; joint consensus; membership changes; a durable storage backend with an fsync contract (see Section~\ref{sec:storage}); metrics.
+
+\begin{invariantbox}[Architectural thesis]
+A pure Raft engine + libp2p Behaviour--Handler + unary multiplexed RPC is a viable composition; the adapter uses correlation IDs, a static peer map, deadline-driven ticks, and separates transport failure from membership.
+\end{invariantbox}
+
+\section{Conclusion}
+
+This whitepaper describes in detail how \textbf{libp2p-raft} separates consensus from networking: \code{RaftEngine} upholds the Raft invariants; \code{RaftBehaviour} translates \code{Action}s into dials and handler events; \code{RaftHandler} executes unary framed RPCs over Yamux. The Swarm orchestrates everything without knowing about Raft. Within its simplified scope, the system is a laboratory for studying how a consensus state machine maps onto a modern P2P stack.

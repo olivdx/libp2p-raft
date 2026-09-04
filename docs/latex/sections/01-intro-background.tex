@@ -1,0 +1,51 @@
+\section{Introduction}
+
+A replicated state machine needs a consensus protocol so that several processes agree on a single ordered history of commands, even in the presence of crashes or temporary network partitions. Raft~\cite{ongaro2014raft} decomposes the problem into leader election, log replication and safety invariants, and is comparatively easier to implement and test than Paxos.
+
+In parallel, libp2p~\cite{libp2p} provides a modular networking stack: transport upgrades, cryptographic identity, and substream multiplexing. In rust-libp2p an application expresses a protocol through \code{NetworkBehaviour} (one instance per node) and \code{ConnectionHandler} (one instance per connection) rather than through raw sockets.
+
+\textbf{libp2p-raft} is a research implementation that plugs a mini-Raft into a \code{NetworkBehaviour}. The crate does \textbf{not} own the \code{Swarm}: the host (\code{bin/raft-node.rs}) assembles TCP + Noise + Yamux via \code{SwarmBuilder}, attaches \code{RaftBehaviour}, and drives the event loop. Architectural goals:
+\begin{enumerate}[label=(\roman*), nosep]
+  \item make the Behaviour--Handler lifecycle and the unary-RPC-over-substream model explicit;
+  \item keep consensus logic independent of \code{PeerId}, dialing and stream handles --- the engine is testable without a Swarm.
+\end{enumerate}
+
+This document goes deep into module boundaries, event contracts, control flows and the execution model. It does not attempt to prove that the Raft implementation is production-ready.
+
+\section{Raft background (structured summary)}
+
+\subsection{Roles and time}
+
+Time is divided into monotonically increasing \emph{terms}. Each server is in one of three roles: \textbf{Follower} (passive), \textbf{Candidate} (requesting votes), \textbf{Leader} (accepting commands, replicating). A follower whose \code{election\_timeout} expires becomes a Candidate $\rightarrow$ \code{RequestVote}. The leader sends empty \code{AppendEntries} as heartbeats to reset follower timeouts.
+
+\subsection{Safety}
+
+\begin{itemize}[nosep]
+  \item \textbf{Election safety:} at most one valid leader per term (majorities intersect).
+  \item \textbf{Log matching:} check \code{prev\_log\_index} / \code{prev\_log\_term}; the leader decrements \code{next\_index} on reject.
+  \item \textbf{State machine safety:} the same log prefix is applied on every replica.
+\end{itemize}
+
+\subsection{Persistent and volatile state}
+
+\textbf{Hard state:} \code{current\_term}, \code{voted\_for}, the log. \textbf{Volatile:} \code{commit\_index}, \code{last\_applied}; on the leader additionally \code{next\_index}, \code{match\_index}. In libp2p-raft the \code{Storage::persist} contract describes an atomic batch; implementations may be in-memory or file-based --- durability depends on the backend (see Section~\ref{sec:storage}).
+
+\section{rust-libp2p background}
+
+\subsection{Swarm}
+
+The \code{Swarm} is the node-level event loop: transports, listeners, dialing, connection pool. Each connection runs in its own task holding one \code{ConnectionHandler}. Behaviour and handler do \textbf{not} call each other directly --- the Swarm routes \code{NotifyHandler} and \code{on\_connection\_handler\_event}.
+
+\subsection{Unary RPC over Yamux}
+
+Long-lived connections (TCP + Noise + Yamux) amortise handshake cost. Each Raft RPC opens a new \textbf{substream}, negotiates \code{/libp2p-raft/1.0.0}, exchanges one request and one response, and closes the substream. Concurrent RPCs do not block each other on the same connection.
+
+\subsection{Hexagonal / ports-and-adapters}
+
+The engine takes: ticks (\code{Instant}), RPCs (\code{NodeId}, \code{RaftMessage}), proposals. It returns \code{Action}s (send to node $k$, apply, change role). The adapter (\code{RaftBehaviour}) handles identity mapping, correlation IDs, dialing and timeouts --- separating \emph{loss of connectivity} (a network event) from \emph{membership change} (a change through the log).
+
+\begin{boundarybox}
+Engine $\rightarrow$ only \code{NodeId}, \code{RaftMessage}, \code{Instant}.\\
+Behaviour $\rightarrow$ \code{NodeId} $\leftrightarrow$ \code{PeerId}, \code{correlation\_id}, RPC lifecycle, dialing.\\
+Handler $\rightarrow$ \code{WireEnvelope} bytes on a substream.
+\end{boundarybox}

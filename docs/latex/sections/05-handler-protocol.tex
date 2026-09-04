@@ -1,0 +1,84 @@
+\section{RaftHandler --- ConnectionHandler}
+
+\subsection{FromBehaviour / ToBehaviour contract}
+
+\begin{center}
+\begin{tabular}{@{}L{0.18\linewidth}L{\restwidth{0.18\linewidth}}@{}}
+\toprule
+\textbf{Direction} & \textbf{Variant} \\
+\midrule
+BH $\rightarrow$ H & \code{SendRequest \{ correlation\_id, msg \}} \\
+BH $\rightarrow$ H & \code{SendResponse \{ channel\_id, correlation\_id, msg \}} \\
+H $\rightarrow$ BH & \code{Request \{ correlation\_id, msg, channel\_id \}} \\
+H $\rightarrow$ BH & \code{Response \{ correlation\_id, msg \}} \\
+H $\rightarrow$ BH & \code{Failure \{ correlation\_id?, error \}} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Handler state}
+
+\code{pending\_outbound}, \code{inflight} (\code{FuturesUnordered}), \code{response\_txs} (oneshot for inbound writes), \code{pending\_events}, and the \code{inbound\_channel\_id} allocator.
+
+\code{connection\_keep\_alive() == true} --- keeps the connection open between unary heartbeats.
+
+\subsection{\code{RaftHandler::poll} ordering}
+
+\begin{enumerate}[label=\textbf{H\arabic*.}, nosep]
+  \item Drain \code{pending\_events} $\rightarrow$ \code{NotifyBehaviour}.
+  \item Pop \code{pending\_outbound} $\rightarrow$ \code{OutboundSubstreamRequest} + \code{OutboundInfo}.
+  \item Poll \code{inflight}: \code{OutboundDone}, \code{InboundRead}, \code{InboundWritten}, \code{Failed}.
+\end{enumerate}
+
+\subsection{Inbound unary (detailed)}
+
+\begin{enumerate}[label=\arabic*., nosep]
+  \item \code{FullyNegotiatedInbound} $\rightarrow$ asynchronously read the frame.
+  \item \code{InboundRead}: insert \code{response\_txs[channel\_id]}, queue \code{ToBehaviour::Request}.
+  \item Spawn a write future that waits on the oneshot for \code{SendResponse}.
+  \item Encode the response $\rightarrow$ \code{InboundWritten}.
+\end{enumerate}
+
+\subsection{Outbound unary}
+
+\begin{enumerate}[label=\arabic*., nosep]
+  \item \code{SendRequest} $\rightarrow$ queue outbound.
+  \item Negotiate the outbound substream.
+  \item Write the request frame, read the response.
+  \item Return \code{ToBehaviour::Response} to the behaviour.
+\end{enumerate}
+
+\section{Protocol and codec specification}
+
+\subsection{Protocol ID and framing}
+
+\begin{itemize}[nosep]
+  \item Protocol: \code{/libp2p-raft/1.0.0} (\code{ReadyUpgrade<StreamProtocol>}).
+  \item Frame: \code{u32} big-endian length + bincode(\code{WireEnvelope}).
+  \item \code{MAX\_FRAME\_BYTES} = 4 MiB in the handler.
+\end{itemize}
+
+\subsection{WireEnvelope and RaftMessage}
+
+\begin{lstlisting}
+pub struct WireEnvelope {
+    pub correlation_id: u64,
+    pub msg: RaftMessage,
+}
+\end{lstlisting}
+
+{\raggedright
+Variants: \code{RequestVote}, \code{RequestVoteResp}, \code{AppendEntries}, \code{AppendEntriesResp}, \code{InstallSnapshot}, \code{InstallSnapshotResp}. Heartbeat = \code{AppendEntries} with \code{entries: []}.\par}
+
+\subsection{Codec (\code{protocol/codec.rs})}
+
+\begin{itemize}[nosep]
+  \item \code{encode\_envelope}: bincode-serialize, prepend the length.
+  \item \code{decode\_envelope}: \code{Cursor::new(bytes)} reads the \code{u32}, slices the payload, deserializes --- entirely in memory.
+\end{itemize}
+
+\section{Identity and bootstrap}
+
+\code{NodeId} (u64) = Raft identity / membership. \code{PeerId} = libp2p keypair (must be pinned). \code{SeedPeer \{ node\_id, peer\_id, addrs \}} lives in the config. Voters are configured before the first election timeout. No DHT is needed for a minimal deployment: dial seeds or accept inbound connections + a shared \code{PeerMap}.
+
+\code{node\_identity.rs}: deterministic keypair per \code{node\_id} in the demo (a real deployment must keep keys stable).
