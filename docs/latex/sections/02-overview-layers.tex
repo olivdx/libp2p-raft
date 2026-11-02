@@ -1,5 +1,106 @@
 \section{Layered architecture overview}
 
+\subsection{Infrastructure architecture}
+
+Building a Raft protocol on libp2p takes two infrastructure views: what runs \emph{inside} one node
+(Figure~\ref{fig:node-arch}) and how nodes are \emph{deployed and connected} as a cluster
+(Figure~\ref{fig:cluster-arch}).
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  layer/.style={draw=brand!60, fill=brand!8, rounded corners=2pt, align=center, font=\small},
+  comp/.style={draw=black!45, fill=white, rounded corners=2pt, align=center, font=\small, inner sep=3pt},
+  wire/.style={draw=black!40, fill=codebg, align=center, font=\scriptsize,
+    text width=2.8cm, inner sep=1pt, minimum height=0.85cm},
+  flow/.style={-{Stealth[length=2mm]}, semithick, draw=black!75},
+  flowlbl/.style={font=\scriptsize, fill=white, inner sep=1pt, align=center}]
+% Application
+\node[layer, minimum width=15cm, minimum height=1.1cm] (app) at (7.5,0)
+  {\textbf{Application} (\code{bin/raft-node.rs})\\[-1pt]
+   {\scriptsize state machine, \code{propose(data)}, handles \code{Event}s, calls \code{compact}}};
+% Swarm frame
+\draw[draw=black!40, dashed, rounded corners=3pt] (0,-1.3) rectangle (15,-6.9);
+\node[font=\scriptsize\itshape, text=muted, anchor=north east] at (14.9,-1.35)
+  {Swarm --- rust-libp2p event loop (tokio)};
+% Behaviour / Engine / Storage / Handlers
+\node[comp, minimum width=6.2cm, minimum height=1.6cm] (beh) at (3.5,-2.75)
+  {\textbf{RaftBehaviour} (\code{NetworkBehaviour})\\[-1pt]
+   {\scriptsize \code{PeerMap}, \code{pending}, \code{inbound\_channels}, \code{Sleep}}\\[-1pt]
+   {\scriptsize dialing, RPC timeouts, \code{execute\_actions}}};
+\node[comp, minimum width=5.6cm, minimum height=1.6cm] (eng) at (12.0,-2.75)
+  {\textbf{RaftEngine} (pure, synchronous)\\[-1pt]
+   {\scriptsize election, replication, commit}\\[-1pt]
+   {\scriptsize snapshot transfer, membership}};
+\node[comp, minimum width=5.6cm, minimum height=1.3cm, fill=codebg] (sto) at (12.0,-5.4)
+  {\textbf{Storage} (trait)\\[-1pt]
+   {\scriptsize \code{HardState}, log, snapshot}\\[-1pt]
+   {\scriptsize \code{DATA\_DIR/snapshot.bin}}};
+\node[comp, minimum width=6.2cm, minimum height=1.3cm] at (3.7,-5.2) {};
+\node[comp, minimum width=6.2cm, minimum height=1.3cm] at (3.6,-5.3) {};
+\node[comp, minimum width=6.2cm, minimum height=1.3cm] (hd) at (3.5,-5.4)
+  {\textbf{RaftHandler} $\times N$ (one per connection)\\[-1pt]
+   {\scriptsize unary substreams, codec, \code{FuturesUnordered}}};
+% Flows
+\draw[flow] (2.6,-0.55) -- node[flowlbl]{\code{propose}, \code{compact}} (2.6,-1.95);
+\draw[flow] (4.9,-1.95) -- node[flowlbl]{\code{Event}} (4.9,-0.55);
+\draw[flow] (6.6,-2.4) -- node[flowlbl, above=1pt]{\code{tick} / \code{handle\_rpc}} (9.2,-2.4);
+\draw[flow] (9.2,-3.1) -- node[flowlbl, below=1pt]{\code{Vec<Action>}} (6.6,-3.1);
+\draw[flow] (12.0,-3.55) -- node[flowlbl]{\code{persist}, \code{install\_snapshot}} (12.0,-4.75);
+\draw[flow] (2.4,-3.55) -- node[flowlbl, left=1pt]{\code{NotifyHandler}} (2.4,-4.55);
+\draw[flow] (4.6,-4.55) -- node[flowlbl, right=1pt]{\code{ToBehaviour}} (4.6,-3.55);
+% Wire stack
+\node[wire] (w1) at (1.5,-7.6) {\textbf{Framing}\\ \code{u32} len + bincode};
+\node[wire] (w2) at (4.5,-7.6) {\textbf{Protocol}\\ \code{/libp2p-raft/1.0.0}};
+\node[wire] (w3) at (7.5,-7.6) {\textbf{Yamux}\\ multiplexing};
+\node[wire] (w4) at (10.5,-7.6) {\textbf{Noise}\\ encryption + auth};
+\node[wire] (w5) at (13.5,-7.6) {\textbf{TCP}\\ \code{/ip4/.../tcp/4101}};
+\draw[flow] (3.5,-6.05) -- (3.5,-7.175);
+\draw[flow, <->] (7.5,-8.03) -- (7.5,-8.75) node[below, font=\small] {other Raft nodes (same stack)};
+\end{tikzpicture}
+\caption{Inside one node: the Raft engine is pure logic owned by the behaviour; all networking goes
+through the Swarm, the per-connection handlers and the libp2p transport stack.}
+\label{fig:node-arch}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  node box/.style={draw=brand!60, fill=brand!8, rounded corners=2pt, align=center, font=\small,
+    minimum width=4.2cm, minimum height=2.2cm, inner sep=3pt},
+  cfg/.style={draw=black!45, fill=codebg, rounded corners=2pt, align=center, font=\small, inner sep=4pt},
+  link/.style={draw=brand!70, line width=1.4pt},
+  seed/.style={-{Stealth[length=2mm]}, dashed, draw=black!55},
+  lbl/.style={font=\scriptsize, fill=white, inner sep=1pt, align=center}]
+\node[cfg] (cfg) at (7.5,0)
+  {\textbf{\code{config/cluster.toml}} (read by every node via \code{CLUSTER\_CONFIG})\\[-1pt]
+   {\scriptsize \code{voters = [1, 2, 3]}\quad \code{[[nodes]] id, host, port}\quad
+    $\Rightarrow$ \code{SeedPeer \{ NodeId, PeerId, multiaddr \}}}};
+\node[node box] (n1) at (2.2,-3.2)
+  {\textbf{node1} \textcolor{brand}{(leader)}\\[-1pt] {\scriptsize \code{NodeId = 1}}\\[-1pt]
+   {\scriptsize \code{PeerId} = keypair(\code{NodeId})}\\[-1pt]
+   {\scriptsize \code{/ip4/127.0.0.1/tcp/4101}}\\[-1pt] {\scriptsize \code{DATA\_DIR = data/node-1}}};
+\node[node box] (n2) at (7.5,-3.2)
+  {\textbf{node2} (follower)\\[-1pt] {\scriptsize \code{NodeId = 2}}\\[-1pt]
+   {\scriptsize \code{PeerId} = keypair(\code{NodeId})}\\[-1pt]
+   {\scriptsize \code{/ip4/127.0.0.1/tcp/4102}}\\[-1pt] {\scriptsize \code{DATA\_DIR = data/node-2}}};
+\node[node box] (n3) at (12.8,-3.2)
+  {\textbf{node3} (follower)\\[-1pt] {\scriptsize \code{NodeId = 3}}\\[-1pt]
+   {\scriptsize \code{PeerId} = keypair(\code{NodeId})}\\[-1pt]
+   {\scriptsize \code{/ip4/127.0.0.1/tcp/4103}}\\[-1pt] {\scriptsize \code{DATA\_DIR = data/node-3}}};
+\foreach \n in {n1,n2,n3} { \draw[seed] (cfg.south -| \n.north) -- (\n.north); }
+\draw[link] (n1.east) -- (n2.west);
+\draw[link] (n2.east) -- (n3.west);
+\draw[link] (n1.south) to[out=-25, in=-155]
+  node[lbl, below=2pt]{one long-lived connection per peer pair: TCP + Noise + Yamux\\
+  one short-lived substream per RPC (RequestVote, AppendEntries, InstallSnapshot)} (n3.south);
+\end{tikzpicture}
+\caption{Cluster deployment (3 voters, \code{config/cluster.local.toml}). The Docker setup
+(\code{docker-compose.yml}) runs the same binary as 6 nodes on a bridge network
+\code{172.28.0.11--16}, ports \code{4101--4106}; only \code{NODE\_ID} differs per container.}
+\label{fig:cluster-arch}
+\end{figure}
+
 \subsection{Responsibilities}
 
 \begin{center}
